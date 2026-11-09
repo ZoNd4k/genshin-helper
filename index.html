@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Помощник сбора предметов</title>
+<style>
+:root{color-scheme:light dark;--bg:#f5f5f7;--fg:#1d1d1f;--card:#fff;--accent:#2b6cb0;--muted:#6b7280;--border:#e5e7eb}
+@media (prefers-color-scheme:dark){:root{--bg:#111;--fg:#eee;--card:#1c1c1e;--accent:#4a9eff;--muted:#9ca3af;--border:#333}}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--fg);padding:16px 16px 32px;max-width:720px;margin:auto}
+h1{font-size:1.3rem;margin:12px 0 4px}
+.muted{color:var(--muted);font-size:.9rem}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-top:14px}
+button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10px 14px;font-size:1rem;cursor:pointer;margin:4px 4px 4px 0}
+button.secondary{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+button:disabled{opacity:.5;cursor:default}
+textarea{width:100%;min-height:90px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:8px;font:inherit}
+input[type=range]{width:100%}
+label{display:block;margin-top:10px;font-size:.9rem}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border)}
+.row:last-child{border-bottom:0}
+#status{font-weight:600}
+#log{font-family:ui-monospace,monospace;font-size:.8rem;white-space:pre-wrap;max-height:160px;overflow:auto;color:var(--muted)}
+video{display:none}
+</style>
+</head>
+<body>
+<h1>Помощник сбора предметов</h1>
+<p class="muted">Всё работает в браузере. Изображение с экрана обрабатывается на твоём устройстве и никуда не отправляется.</p>
+
+<div class="card">
+  <div id="status">Остановлено</div>
+  <div style="margin-top:10px">
+    <button id="startBtn">Начать захват экрана</button>
+    <button id="stopBtn" class="secondary" disabled>Остановить</button>
+  </div>
+  <p class="muted">Выбери окно с игрой или весь экран в системном диалоге. Нужны Chrome или Edge на компьютере. При первом запуске скачиваются языковые данные (около 10 МБ).</p>
+</div>
+
+<div class="card">
+  <strong>Область уведомлений</strong>
+  <p class="muted">Укажи, где на экране появляется уведомление о предмете (в процентах от окна).</p>
+  <label>Отступ слева: <span id="xv">30</span>%<input type="range" id="x" min="0" max="90" value="30"></label>
+  <label>Отступ сверху: <span id="yv">10</span>%<input type="range" id="y" min="0" max="90" value="10"></label>
+  <label>Ширина: <span id="wv">40</span>%<input type="range" id="w" min="5" max="100" value="40"></label>
+  <label>Высота: <span id="hv">15</span>%<input type="range" id="h" min="2" max="100" value="15"></label>
+  <label>Проверять каждые <span id="iv">2</span> с<input type="range" id="i" min="1" max="10" value="2"></label>
+</div>
+
+<div class="card">
+  <strong>Список предметов</strong>
+  <p class="muted">Вставь названия предметов, по одному на строку. Программа ищет их в тексте уведомления.</p>
+  <textarea id="items" placeholder="Например:&#10;Лист Сакуры&#10;Синий Зефир"></textarea>
+  <button id="saveItems" class="secondary">Сохранить список</button>
+</div>
+
+<div class="card">
+  <strong>Найдено, ждёт подтверждения</strong>
+  <div id="pending"></div>
+</div>
+
+<div class="card">
+  <strong>Собрано: <span id="count">0</span></strong>
+  <div id="collected"></div>
+  <div style="margin-top:10px">
+    <button id="exportBtn" class="secondary">Экспорт JSON</button>
+    <label style="display:inline-block;cursor:pointer;color:var(--accent)">Импорт<input type="file" id="importFile" accept="application/json" hidden></label>
+    <button id="resetBtn" class="secondary">Сбросить</button>
+  </div>
+</div>
+
+<div class="card">
+  <strong>Журнал</strong>
+  <div id="log"></div>
+</div>
+
+<div class="card muted">
+  Отметки переноси на карту: <a href="https://genshin-impact-map.appsample.com/ru/" target="_blank" rel="noopener">genshin-impact-map.appsample.com</a>. Прямой интеграции с картой этот сайт не делает.
+</div>
+
+<video id="video" autoplay muted playsinline></video>
+<canvas id="canvas" hidden></canvas>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const KEY = "gi-helper-collected-v1";
+  const ITEMS_KEY = "gi-helper-items-v1";
+  let stream = null, worker = null, timer = null, busy = false;
+  let collected = loadJSON(KEY, {});
+  let items = loadJSON(ITEMS_KEY, []);
+  let pending = [];
+
+  function loadJSON(k, def) {
+    try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : def; }
+    catch { return def; }
+  }
+  function saveJSON(k, v) {
+    try { localStorage.setItem(k, JSON.stringify(v)); } catch {}
+  }
+  function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    $("log").textContent = `[${t}] ${msg}\n` + $("log").textContent.slice(0, 2000);
+  }
+  function setStatus(s) { $("status").textContent = s; }
+
+  for (const id of ["x", "y", "w", "h", "i"]) {
+    $(id).addEventListener("input", () => $(id + "v").textContent = $(id).value);
+  }
+  $("items").value = items.join("\n");
+  $("saveItems").onclick = () => {
+    items = $("items").value.split("\n").map(s => s.trim()).filter(Boolean);
+    saveJSON(ITEMS_KEY, items);
+    log(`Список сохранён: ${items.length} шт.`);
+  };
+
+  function renderAll() {
+    const p = $("pending");
+    p.innerHTML = "";
+    if (!pending.length) p.innerHTML = '<p class="muted">Пока пусто.</p>';
+    pending.forEach((name, idx) => {
+      const row = document.createElement("div");
+      row.className = "row";
+      const span = document.createElement("span");
+      span.textContent = name;
+      const ok = document.createElement("button");
+      ok.textContent = "Подтвердить";
+      ok.onclick = () => {
+        collected[name] = Date.now();
+        pending.splice(idx, 1);
+        saveJSON(KEY, collected);
+        renderAll();
+        log(`Подтверждено: ${name}`);
+      };
+      const no = document.createElement("button");
+      no.textContent = "Нет";
+      no.className = "secondary";
+      no.onclick = () => { pending.splice(idx, 1); renderAll(); };
+      row.append(span, ok, no);
+      p.appendChild(row);
+    });
+
+    const c = $("collected");
+    c.innerHTML = "";
+    const names = Object.keys(collected).sort();
+    $("count").textContent = names.length;
+    names.forEach(name => {
+      const row = document.createElement("div");
+      row.className = "row";
+      const span = document.createElement("span");
+      span.textContent = name;
+      const del = document.createElement("button");
+      del.textContent = "Убрать";
+      del.className = "secondary";
+      del.onclick = () => { delete collected[name]; saveJSON(KEY, collected); renderAll(); };
+      row.append(span, del);
+      c.appendChild(row);
+    });
+  }
+
+  async function startCapture() {
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      log("Этот браузер не поддерживает захват экрана.");
+      return;
+    }
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 2 }, audio: false });
+    } catch {
+      log("Захват отменён или запрещён.");
+      return;
+    }
+    $("video").srcObject = stream;
+    await $("video").play();
+    stream.getVideoTracks()[0].addEventListener("ended", stopCapture);
+
+    setStatus("Загрузка распознавания…");
+    worker = await Tesseract.createWorker(["rus", "eng"]);
+    setStatus("Идёт распознавание");
+    $("startBtn").disabled = true;
+    $("stopBtn").disabled = false;
+    log("Захват запущен.");
+    schedule();
+  }
+
+  function schedule() {
+    clearInterval(timer);
+    timer = setInterval(scan, Number($("i").value) * 1000);
+  }
+
+  async function scan() {
+    if (busy || !worker) return;
+    const v = $("video");
+    if (!v.videoWidth) return;
+    busy = true;
+    try {
+      const sx = Math.round(v.videoWidth * $("x").value / 100);
+      const sy = Math.round(v.videoHeight * $("y").value / 100);
+      const sw = Math.round(v.videoWidth * $("w").value / 100);
+      const sh = Math.round(v.videoHeight * $("h").value / 100);
+      const c = $("canvas");
+      c.width = sw; c.height = sh;
+      c.getContext("2d").drawImage(v, sx, sy, sw, sh, 0, 0, sw, sh);
+      const { data } = await worker.recognize(c);
+      const text = data.text.toLowerCase().replace(/\s+/g, " ");
+      for (const name of items) {
+        if (text.includes(name.toLowerCase()) && !collected[name] && !pending.includes(name)) {
+          pending.push(name);
+          log(`Найдено в тексте: ${name}`);
+          renderAll();
+        }
+      }
+    } catch (e) {
+      log("Ошибка распознавания: " + e.message);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function stopCapture() {
+    clearInterval(timer);
+    timer = null;
+    stream?.getTracks().forEach(t => t.stop());
+    stream = null;
+    if (worker) { await worker.terminate(); worker = null; }
+    $("startBtn").disabled = false;
+    $("stopBtn").disabled = true;
+    setStatus("Остановлено");
+    log("Захват остановлен.");
+  }
+
+  $("startBtn").onclick = startCapture;
+  $("stopBtn").onclick = stopCapture;
+  $("i").addEventListener("change", () => { if (timer) schedule(); });
+
+  $("exportBtn").onclick = () => {
+    const blob = new Blob([JSON.stringify(collected, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "collected.json";
+    a.click();
+  };
+  $("importFile").onchange = async e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const obj = JSON.parse(await f.text());
+      collected = { ...collected, ...obj };
+      saveJSON(KEY, collected);
+      renderAll();
+      log(`Импортировано записей: ${Object.keys(obj).length}`);
+    } catch { log("Не удалось прочитать файл."); }
+  };
+  $("resetBtn").onclick = () => {
+    if (!confirm("Сбросить весь прогресс?")) return;
+    collected = {};
+    saveJSON(KEY, collected);
+    renderAll();
+  };
+
+  renderAll();
+})();
+</script>
+</body>
+</html>
